@@ -26,6 +26,8 @@ const unordered_set<string> DebugCounter::supported_debug_counter_attributes =
 {
     COUNTER_ALIAS,
     COUNTER_TYPE,
+    COUNTER_THRESHOLD,
+    COUNTER_TIMEOUT,
     COUNTER_DESCRIPTION,
     COUNTER_GROUP
 };

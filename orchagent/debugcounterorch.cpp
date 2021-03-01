@@ -1,4 +1,5 @@
 #include "debugcounterorch.h"
+#include "countercheckorch.h"
 #include "portsorch.h"
 #include "rediscommand.h"
 #include "sai_serialize.h"
@@ -173,6 +174,20 @@ void DebugCounterOrch::doTask(Consumer& consumer)
                 break;
         }
     }
+
+    // TODO: Alexander Allen <arallen@nvidia.com>
+    // Iterate all defined debug counters
+
+    // If timeout defined....
+    // Read UTC timestamp
+    // If differential > timeout then reset counter and timestamp to current time
+
+    // If threshold defined....
+    // Read counter
+    // If count > threshold then update APPL_DB to add the counter to a list of failed counters
+    
+    // NOTE: Need dropconfig command to reset the failed state of a counter?? (Asked Dror) prob will do this
+
 }
 
 // Debug Capability Reporting Functions START HERE -------------------------------------------------
@@ -245,15 +260,22 @@ task_process_status DebugCounterOrch::installDebugCounter(const string& counter_
     // to either: a) dispatch to different handlers in doTask or b) dispatch to
     // different helper methods in this method.
 
-    string counter_type = getDebugCounterType(attributes);
+    counter_attributes* attr_struct = getDebugCounterAttributes(attributes);
 
-    if (supported_counter_types.find(counter_type) == supported_counter_types.end())
+    // If no type assume that its a built-in drop counter and skip installing. 
+    if (attr_struct->type.empty())
     {
-        SWSS_LOG_ERROR("Specified counter type '%s' is not supported.", counter_type.c_str());
+        CounterCheckOrch::getInstance().addDebugCounter(counter_name, attr_struct->type, attr_struct->threshold, attr_struct->timeout);
+    	return task_process_status::task_success;
+    }
+
+    if (supported_counter_types.find(attr_struct->type) == supported_counter_types.end())
+    {
+        SWSS_LOG_ERROR("Specified counter type '%s' is not supported.", attr_struct->type.c_str());
         return task_process_status::task_failed;
     }
 
-    addFreeCounter(counter_name, counter_type);
+    addFreeCounter(counter_name, attr_struct);
     reconcileFreeDropCounters(counter_name);
 
     SWSS_LOG_NOTICE("Succesfully created drop counter %s", counter_name.c_str());
@@ -265,6 +287,7 @@ task_process_status DebugCounterOrch::uninstallDebugCounter(const string& counte
     SWSS_LOG_ENTER();
 
     auto it = debug_counters.find(counter_name);
+    auto attr = debug_attributes.find(counter_name);
     if (it == debug_counters.end())
     {
         if (free_drop_counters.find(counter_name) != free_drop_counters.end())
@@ -273,6 +296,8 @@ task_process_status DebugCounterOrch::uninstallDebugCounter(const string& counte
         }
         else
         {
+            if ( CounterCheckOrch::getInstance().removeDebugCounter(counter_name) )
+    	        return task_process_status::task_success;
             SWSS_LOG_ERROR("Debug counter %s does not exist", counter_name.c_str());
         }
 
@@ -282,8 +307,16 @@ task_process_status DebugCounterOrch::uninstallDebugCounter(const string& counte
     DebugCounter *counter = it->second.get();
     string counter_type = counter->getCounterType();
     string counter_stat = counter->getDebugCounterSAIStat();
+    counter_attributes* attr_struct = attr->second;   
+
+    if (attr_struct->threshold > 0 || attr_struct->timeout > 0)
+    {
+        CounterCheckOrch::getInstance().removeDebugCounter(counter_name);
+    }
+    delete attr_struct;
 
     debug_counters.erase(it);
+    debug_attributes.erase(attr);
     uninstallDebugFlexCounters(counter_type, counter_stat);
 
     if (counter_type == PORT_INGRESS_DROPS || counter_type == PORT_EGRESS_DROPS)
@@ -372,7 +405,7 @@ task_process_status DebugCounterOrch::removeDropReason(const string& counter_nam
 // Free Table Management Functions START HERE ------------------------------------------------------
 
 // Note that entries will remain in the table until at least one drop reason is added to the counter.
-void DebugCounterOrch::addFreeCounter(const string& counter_name, const string& counter_type)
+void DebugCounterOrch::addFreeCounter(const string& counter_name, counter_attributes* attr_struct)
 {
     SWSS_LOG_ENTER();
 
@@ -383,7 +416,7 @@ void DebugCounterOrch::addFreeCounter(const string& counter_name, const string& 
     }
 
     SWSS_LOG_DEBUG("Adding debug counter '%s' to free counter table", counter_name.c_str());
-    free_drop_counters.emplace(counter_name, counter_type);
+    free_drop_counters[counter_name] = attr_struct;
 }
 
 void DebugCounterOrch::deleteFreeCounter(const string& counter_name)
@@ -527,14 +560,14 @@ void DebugCounterOrch::uninstallDebugFlexCounters(const string& counter_type,
 
 // Debug Counter Initialization Helper Functions START HERE ----------------------------------------
 
-// NOTE: At this point COUNTER_TYPE is the only field from CONFIG_DB that we care about. In the future
-// if other fields become relevant it may make sense to extend this method and return a struct with the
-// relevant fields.
-std::string DebugCounterOrch::getDebugCounterType(const vector<FieldValueTuple>& values) const
+counter_attributes* DebugCounterOrch::getDebugCounterAttributes(const vector<FieldValueTuple>& values) const
 {
     SWSS_LOG_ENTER();
 
-    std::string counter_type;
+    counter_attributes* attr_struct = new counter_attributes();
+    attr_struct->threshold = -1; /// Set to Disabled
+    attr_struct->timeout = -1; // Set to Disabled
+
     for (auto attr : values)
     {
         std::string attr_name = fvField(attr);
@@ -547,21 +580,29 @@ std::string DebugCounterOrch::getDebugCounterType(const vector<FieldValueTuple>&
         }
 
         std::string attr_value = fvValue(attr);
+
         if (attr_name == "type")
         {
             auto debug_counter_type_lookup = DebugCounter::getDebugCounterTypeLookup();
             auto counter_type_it = debug_counter_type_lookup.find(attr_value);
             if (counter_type_it == debug_counter_type_lookup.end())
             {
-                SWSS_LOG_ERROR("Debug counter type '%s' does not exist", attr_value.c_str());
-                throw std::runtime_error("Failed to initialize debug counter");
+               SWSS_LOG_ERROR("Debug counter type '%s' does not exist", attr_value.c_str());
+               throw std::runtime_error("Failed to initialize debug counter");
             }
-
-            counter_type = counter_type_it->first;
+            attr_struct->type = counter_type_it->first;
+        }
+        else if (attr_name == "threshold")
+        {
+            attr_struct->threshold = stoi(attr_value);
+        }
+        else if (attr_name == "timeout")
+        {
+            attr_struct->timeout = stoi(attr_value);
         }
     }
 
-    return counter_type;
+    return attr_struct;
 }
 
 // createDropCounter creates a new drop counter in the SAI and installs a
@@ -569,14 +610,20 @@ std::string DebugCounterOrch::getDebugCounterType(const vector<FieldValueTuple>&
 //
 // If SAI initialization fails or flex counter installation fails then this
 // method will throw an exception.
-void DebugCounterOrch::createDropCounter(const string& counter_name, const string& counter_type, const unordered_set<string>& drop_reasons)
+void DebugCounterOrch::createDropCounter(const string& counter_name, counter_attributes* attr_struct, const unordered_set<string>& drop_reasons)
 {
-    auto counter = std::unique_ptr<DropCounter>(new DropCounter(counter_name, counter_type, drop_reasons));
+    auto counter = std::unique_ptr<DropCounter>(new DropCounter(counter_name, attr_struct->type, drop_reasons));
     std::string counter_stat = counter->getDebugCounterSAIStat();
     debug_counters.emplace(counter_name, std::move(counter));
-    installDebugFlexCounters(counter_type, counter_stat);
+    debug_attributes[counter_name]  = attr_struct;
+    installDebugFlexCounters(attr_struct->type, counter_stat);
+    
+    if (attr_struct->threshold > 0 || attr_struct->timeout > 0)
+    {	
+        CounterCheckOrch::getInstance().addDebugCounter(counter_name, attr_struct->type, attr_struct->threshold, attr_struct->timeout);
+    }
 
-    if (counter_type == PORT_INGRESS_DROPS || counter_type == PORT_EGRESS_DROPS)
+    if (attr_struct->type == PORT_INGRESS_DROPS || attr_struct->type == PORT_EGRESS_DROPS)
     {
         m_counterNameToPortStatMap->set("", { FieldValueTuple(counter_name, counter_stat) });
     }

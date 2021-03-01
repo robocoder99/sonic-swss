@@ -6,7 +6,14 @@
 #include "sai_serialize.h"
 #include <inttypes.h>
 
-#define COUNTER_CHECK_POLL_TIMEOUT_SEC   (5 * 60)
+#define COUNTER_CHECK_POLL_INTERVAL_SEC    5
+#define COUNTER_MAX_INTERVAL_COUNT         300
+
+#define PFC_CHECK_INTERVAL_COUNT           60
+#define MC_CHECK_INTERVAL_COUNT            60
+#define DEBUG_CHECK_INTERVAL_COUNT         1
+
+#define DROPSTAT_DIR "/tmp/dropstat/"
 
 extern sai_port_api_t *sai_port_api;
 
@@ -25,15 +32,33 @@ CounterCheckOrch& CounterCheckOrch::getInstance(DBConnector *db)
 CounterCheckOrch::CounterCheckOrch(DBConnector *db, vector<string> &tableNames):
     Orch(db, tableNames),
     m_countersDb(new DBConnector("COUNTERS_DB", 0)),
-    m_countersTable(new Table(m_countersDb.get(), COUNTERS_TABLE))
+    m_asicDb(new DBConnector("ASIC_DB", 0)),
+    m_applDb(new DBConnector("APPL_DB", 0)),
+    m_countersTable(new Table(m_countersDb.get(), COUNTERS_TABLE)),
+    m_countersSwitchStatTable(new Table(m_countersDb.get(), COUNTERS_DEBUG_NAME_SWITCH_STAT_MAP)),
+    m_countersPortStatTable(new Table(m_countersDb.get(), COUNTERS_DEBUG_NAME_PORT_STAT_MAP)),
+    m_countersPortNameTable(new Table(m_countersDb.get(), COUNTERS_PORT_NAME_MAP)),
+    m_asicStateTable(new Table(m_asicDb.get(), "ASIC_STATE:SAI_OBJECT_TYPE_SWITCH")),
+    m_applPortTable(new Table(m_applDb.get(), APP_PORT_TABLE_NAME))
 {
     SWSS_LOG_ENTER();
 
-    auto interv = timespec { .tv_sec = COUNTER_CHECK_POLL_TIMEOUT_SEC, .tv_nsec = 0 };
+    auto interv = timespec { .tv_sec = COUNTER_CHECK_POLL_INTERVAL_SEC, .tv_nsec = 0 };
     auto timer = new SelectableTimer(interv);
     auto executor = new ExecutableTimer(timer, this, "MC_COUNTERS_POLL");
     Orch::addExecutor(executor);
+
+    m_stdPortMap = {
+        {"RX_ERR",   "SAI_PORT_STAT_IF_IN_ERRORS"},
+        {"RX_DROPS", "SAI_PORT_STAT_IF_IN_DISCARDS"},
+        {"TX_ERR",   "SAI_PORT_STAT_IF_OUT_ERRORS"},
+        {"TX_DROPS", "SAI_PORT_STAT_IF_OUT_DISCARDS"},
+        {"TX_OK",    "SAI_PORT_STAT_ETHER_STATS_TX_NO_ERRORS"}
+    };
+
+    interval_count = 0;
     timer->start();
+
 }
 
 CounterCheckOrch::~CounterCheckOrch(void)
@@ -45,8 +70,178 @@ void CounterCheckOrch::doTask(SelectableTimer &timer)
 {
     SWSS_LOG_ENTER();
 
-    mcCounterCheck();
-    pfcFrameCounterCheck();
+    if(interval_count % MC_CHECK_INTERVAL_COUNT == 0) 
+        mcCounterCheck();
+
+    if(interval_count % PFC_CHECK_INTERVAL_COUNT == 0) 
+        pfcFrameCounterCheck();
+
+    if(interval_count % DEBUG_CHECK_INTERVAL_COUNT == 0) 
+        debugCounterCheck();
+
+    interval_count++;
+
+    if(interval_count % COUNTER_MAX_INTERVAL_COUNT == 0)
+        interval_count = 0;
+
+}
+
+
+std::string CounterCheckOrch::getStatName(const std::string counter_name, const std::string counter_type)
+{
+    vector<FieldValueTuple> fieldValues;
+    // Get SAI stat name of counter
+    if (counter_type.find("PORT") != std::string::npos)
+    {
+        m_countersPortStatTable->get("", fieldValues);
+
+    }
+    else if (counter_type.find("SWITCH") != std::string::npos)
+    {
+        m_countersSwitchStatTable->get("", fieldValues); 
+    }
+
+    for (const auto& fv : fieldValues)
+    {
+        const auto field = fvField(fv);
+        const auto value = fvValue(fv);
+
+        if (field == counter_name)
+        {
+            return value;
+        }
+    }
+
+    if (counter_type.empty())
+    {
+       return m_stdPortMap[counter_name];
+    }
+
+    return std::string();
+}
+
+void CounterCheckOrch::addPortAlarm(const std::string dev_name, const std::string counter_name)
+{
+    SWSS_LOG_ERROR("Counter %s out of bounds on port %s.", counter_name.c_str(), dev_name.c_str());
+
+    if (dev_name == "Switch")
+        return;
+
+    vector<FieldValueTuple> fieldValues;
+    m_applPortTable->get(dev_name, fieldValues);
+
+    fieldValues.push_back(FieldValueTuple("alarm", counter_name));
+    m_applPortTable->set(dev_name, fieldValues);
+
+}
+
+void CounterCheckOrch::removePortAlarm(const std::string dev_name, const std::string counter_name)
+{
+    if (dev_name == "Switch")
+        return;
+
+    vector<FieldValueTuple> fieldValues;
+    m_applPortTable->get(dev_name, fieldValues);
+
+    fieldValues.push_back(FieldValueTuple("alarm", ""));
+    m_applPortTable->set(dev_name, fieldValues);
+}
+
+void CounterCheckOrch::processPortCounters(const std::string counter_name, const std::string stat_name, const std::string dev_name, const std::string oid)
+{
+    vector<FieldValueTuple> portData;
+    m_countersTable->get(oid, portData);
+    
+    int last_count = 0;
+    long int ts = 0;
+    
+    int& threshold = std::get<1>(debugCounterMap[counter_name]);
+    int& timeout = std::get<2>(debugCounterMap[counter_name]);
+
+    std::map<std::string, long int>& timestamp = std::get<3>(debugCounterMap[counter_name]);
+    std::map<std::string, int>& lcounts = std::get<4>(debugCounterMap[counter_name]);
+    
+    long int now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+
+    if ( lcounts.find(oid) != lcounts.end() )
+    {
+        last_count = lcounts[oid];
+    }
+    if ( timestamp.find(oid) != timestamp.end() )
+    {
+        ts = timestamp[oid];
+    }
+
+    for (const auto& pfv : portData)
+    {
+        const auto pfield = fvField(pfv);
+        const auto pvalue = fvValue(pfv);
+
+        if (pfield == stat_name)
+        {
+	    if( (now - ts) > timeout && timeout > 0 )
+            {
+                lcounts[oid] = stoi(pvalue); // Reset count
+                timestamp[oid] = now;
+
+                if ( (stoi(pvalue) - last_count) < threshold )
+                {
+            	    removePortAlarm(dev_name, counter_name);
+                }
+            }
+
+	    if( (stoi(pvalue) - last_count) > threshold && threshold > 0)
+            {
+		addPortAlarm(dev_name, counter_name);
+	    }
+
+            break;
+        }
+    }
+}
+
+vector<FieldValueTuple> CounterCheckOrch::getDevices(std::string counter_type)
+{ 
+    if (counter_type.find("SWITCH") != std::string::npos)
+    {
+        vector<string> keys;
+        m_asicStateTable->getKeys(keys);
+        return {{"Switch", keys[0]}};
+    }
+        
+    vector<FieldValueTuple> portNames;
+    m_countersPortNameTable->get("", portNames);
+    return portNames;
+}
+
+void CounterCheckOrch::debugCounterCheck()
+{
+    SWSS_LOG_ENTER();
+
+    for (auto& i : debugCounterMap)
+    {
+        std::string counter_name = i.first;
+        std::string counter_type;
+        int threshold;
+        int timeout;
+        
+        std::tie (counter_type, threshold, timeout, std::ignore, std::ignore) = i.second;
+
+        if ( timeout < 0 && threshold < 0 )
+        {
+            continue;
+        }
+
+        std::string stat_name = getStatName(counter_name, counter_type);
+        
+        for (const auto& fv : getDevices(counter_type))
+        {
+            const auto field = fvField(fv);
+            const auto value = fvValue(fv);
+
+            processPortCounters(counter_name, stat_name, field, value);
+        }
+    } 
 }
 
 void CounterCheckOrch::mcCounterCheck()
@@ -223,6 +418,38 @@ QueueMcCounters CounterCheckOrch::getQueueMcCounters(
     return move(counters);
 }
 
+void CounterCheckOrch::addDebugCounter(const std::string counter_name, const std::string counter_type, int threshold, int timeout)
+{
+    auto it = debugCounterMap.find(counter_name);
+    if(it == debugCounterMap.end())
+    {
+        debugCounterMap.emplace(counter_name, 
+                 std::tuple<std::string, int, int, std::map<std::string, long int>, std::map<std::string, int>>{
+                     counter_type, 
+                     threshold, 
+                     timeout, 
+                     {},
+                     {}
+                 });
+    }
+    else
+    {
+        auto& dat = debugCounterMap[counter_name];
+        std::get<1>(dat) = threshold;
+        std::get<2>(dat) = timeout;
+    }
+}
+
+int CounterCheckOrch::removeDebugCounter(const std::string counter_name)
+{
+    auto it = debugCounterMap.find(counter_name);
+    if(it != debugCounterMap.end())
+    {
+        debugCounterMap.erase(it); 
+        return 1;
+    }
+    return 0;
+}
 
 void CounterCheckOrch::addPort(const Port& port)
 {

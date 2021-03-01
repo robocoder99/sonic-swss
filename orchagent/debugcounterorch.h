@@ -17,6 +17,13 @@ extern "C" {
 
 #define DEBUG_COUNTER_FLEX_COUNTER_GROUP "DEBUG_COUNTER"
 
+// Attributes form CONFIG_DB for the debug counters
+struct counter_attributes {
+    std::string type;
+    int threshold;
+    int timeout;
+};
+
 // DebugCounterOrch is an orchestrator for managing debug counters. It handles
 // the creation, deletion, and modification of debug counters.
 class DebugCounterOrch: public Orch
@@ -38,7 +45,7 @@ private:
     task_process_status removeDropReason(const std::string& counter_name, const std::string& drop_reason);
 
     // Free Table Management Functions
-    void addFreeCounter(const std::string& counter_name, const std::string& counter_type);
+    void addFreeCounter(const std::string& counter_name, counter_attributes* attr_struct);
     void deleteFreeCounter(const std::string& counter_name);
     void addFreeDropReason(const std::string& counter_name, const std::string& drop_reason);
     void deleteFreeDropReason(const std::string& counter_name, const std::string& drop_reason);
@@ -54,11 +61,11 @@ private:
             const std::string& counter_stat);
 
     // Debug Counter Initialization Helper Functions
-    std::string getDebugCounterType(
+    counter_attributes* getDebugCounterAttributes(
             const std::vector<swss::FieldValueTuple>& values) const noexcept(false);
     void createDropCounter(
             const std::string& counter_name,
-            const std::string& counter_type,
+            counter_attributes* attr_struct,
             const std::unordered_set<std::string>& drop_reasons) noexcept(false);
 
     // Debug Counter Configuration Helper Functions
@@ -84,12 +91,13 @@ private:
     FlexCounterStatManager flex_counter_manager;
 
     std::unordered_map<std::string, std::unique_ptr<DebugCounter>> debug_counters;
+    std::unordered_map<std::string, counter_attributes*> debug_attributes;
 
     // free_drop_counters are drop counters that have been created by a user
     // that do not have any drop reasons associated with them yet. Because
     // we cannot create a drop counter without any drop reasons, we keep track
     // of these counters in this table.
-    std::unordered_map<std::string, std::string> free_drop_counters;
+    std::unordered_map<std::string, counter_attributes*> free_drop_counters;
 
     // free_drop_reasons are drop reasons that have been added by a user
     // that do not have a counter associated with them yet. Because we

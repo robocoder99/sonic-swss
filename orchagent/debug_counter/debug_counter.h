@@ -12,6 +12,8 @@ extern "C" {
 // Supported debug counter attributes.
 #define COUNTER_ALIAS       "alias"
 #define COUNTER_TYPE        "type"
+#define COUNTER_THRESHOLD   "threshold"
+#define COUNTER_TIMEOUT     "timeout"
 #define COUNTER_DESCRIPTION "desc"
 #define COUNTER_GROUP       "group"
 
